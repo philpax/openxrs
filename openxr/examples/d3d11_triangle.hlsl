@@ -9,26 +9,26 @@ struct VSOutput
 {
     float4 position : SV_Position;
     float3 color : COLOR;
-    uint view_id : SV_ViewID;
+    uint view_id : SV_RenderTargetArrayIndex;
 };
 
 // Constant buffer for transformation matrices
 cbuffer TransformBuffer : register(b0)
 {
-    float4x4 viewProj[2]; // View-projection matrices for both eyes
-    float4x4 model;       // Model transformation matrix
+    row_major float4x4 viewProj[2]; // View-projection matrices for both eyes
+    row_major float4x4 model;       // Model transformation matrix
 };
 
 // Vertex Shader
-VSOutput VSMain(VSInput input, uint viewId : SV_ViewID)
+VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
 {
     VSOutput output;
 
     // Transform position: model -> view -> projection
     float4 worldPos = mul(float4(input.position, 1.0), model);
-    output.position = mul(worldPos, viewProj[viewId]);
+    output.position = mul(worldPos, viewProj[instanceId]);
     output.color = input.color;
-    output.view_id = viewId;
+    output.view_id = instanceId;
 
     return output;
 }

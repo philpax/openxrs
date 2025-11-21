@@ -5,21 +5,17 @@
 //! This example uses minimal abstraction for clarity. Real-world code should encapsulate and
 //! largely decouple its D3D11 and OpenXR components and handle errors gracefully.
 
+use std::mem;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use std::mem;
 
 use openxr as xr;
 use windows::{
-    core::*,
-    Win32::Foundation::*,
-    Win32::Graphics::Direct3D::*,
-    Win32::Graphics::Direct3D::Fxc::*,
-    Win32::Graphics::Direct3D11::*,
-    Win32::Graphics::Dxgi::Common::*,
+    Win32::Foundation::*, Win32::Graphics::Direct3D::Fxc::*, Win32::Graphics::Direct3D::*,
+    Win32::Graphics::Direct3D11::*, Win32::Graphics::Dxgi::Common::*, core::*,
 };
 
 #[repr(C)]
@@ -33,7 +29,39 @@ struct Vertex {
 #[derive(Copy, Clone)]
 struct TransformBuffer {
     view_proj: [[f32; 16]; 2], // Two 4x4 matrices for stereo
-    model: [f32; 16],            // 4x4 model matrix
+    model: [f32; 16],          // 4x4 model matrix
+}
+
+// Helper function to create model matrix from position and scale
+fn model_matrix_from_pose(pos: &xr::Vector3f, quat: &xr::Quaternionf, scale: f32) -> [f32; 16] {
+    let xx = quat.x * quat.x;
+    let yy = quat.y * quat.y;
+    let zz = quat.z * quat.z;
+    let xy = quat.x * quat.y;
+    let xz = quat.x * quat.z;
+    let yz = quat.y * quat.z;
+    let wx = quat.w * quat.x;
+    let wy = quat.w * quat.y;
+    let wz = quat.w * quat.z;
+
+    [
+        scale * (1.0 - 2.0 * (yy + zz)),
+        scale * (2.0 * (xy + wz)),
+        scale * (2.0 * (xz - wy)),
+        0.0,
+        scale * (2.0 * (xy - wz)),
+        scale * (1.0 - 2.0 * (xx + zz)),
+        scale * (2.0 * (yz + wx)),
+        0.0,
+        scale * (2.0 * (xz + wy)),
+        scale * (2.0 * (yz - wx)),
+        scale * (1.0 - 2.0 * (xx + yy)),
+        0.0,
+        pos.x,
+        pos.y,
+        pos.z,
+        1.0,
+    ]
 }
 
 pub fn main() {
@@ -119,7 +147,10 @@ pub fn main() {
         let device = device.unwrap();
         let device_context = device_context.unwrap();
 
-        println!("Created D3D11 device with feature level: {:?}", feature_level);
+        println!(
+            "Created D3D11 device with feature level: {:?}",
+            feature_level
+        );
 
         let (session, mut frame_wait, mut frame_stream) = xr_instance
             .create_session::<xr::D3D11>(
@@ -225,11 +256,7 @@ pub fn main() {
 
         let mut input_layout: Option<ID3D11InputLayout> = None;
         device
-            .CreateInputLayout(
-                &input_layout_desc,
-                vs_bytecode,
-                Some(&mut input_layout),
-            )
+            .CreateInputLayout(&input_layout_desc, vs_bytecode, Some(&mut input_layout))
             .expect("Failed to create input layout");
         let input_layout = input_layout.unwrap();
 
@@ -266,7 +293,11 @@ pub fn main() {
 
         let mut vertex_buffer: Option<ID3D11Buffer> = None;
         device
-            .CreateBuffer(&vertex_buffer_desc, Some(&vertex_data), Some(&mut vertex_buffer))
+            .CreateBuffer(
+                &vertex_buffer_desc,
+                Some(&vertex_data),
+                Some(&mut vertex_buffer),
+            )
             .expect("Failed to create vertex buffer");
         let vertex_buffer = vertex_buffer.unwrap();
 
@@ -402,7 +433,11 @@ pub fn main() {
 
             if !xr_frame_state.should_render {
                 frame_stream
-                    .end(xr_frame_state.predicted_display_time, environment_blend_mode, &[])
+                    .end(
+                        xr_frame_state.predicted_display_time,
+                        environment_blend_mode,
+                        &[],
+                    )
                     .unwrap();
                 continue;
             }
@@ -526,12 +561,18 @@ pub fn main() {
 
             let stride = mem::size_of::<Vertex>() as u32;
             let offset = 0u32;
-            device_context.IASetVertexBuffers(0, 1, Some(&Some(vertex_buffer.clone())), Some(&stride), Some(&offset));
+            device_context.IASetVertexBuffers(
+                0,
+                1,
+                Some(&Some(vertex_buffer.clone())),
+                Some(&stride),
+                Some(&offset),
+            );
 
-            device_context.Draw(3, 0);
+            // Draw main triangle
+            device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
 
-            swapchain.handle.release_image().unwrap();
-
+            // Get hand positions before releasing swapchain image
             session.sync_actions(&[(&action_set).into()]).unwrap();
 
             let right_location = right_space
@@ -540,6 +581,65 @@ pub fn main() {
             let left_location = left_space
                 .locate(&stage, xr_frame_state.predicted_display_time)
                 .unwrap();
+
+            // Draw hand triangles
+            if left_action.is_active(&session, xr::Path::NULL).unwrap()
+                && left_location
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
+            {
+                let mut hand_mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                device_context
+                    .Map(
+                        &constant_buffer,
+                        0,
+                        D3D11_MAP_WRITE_DISCARD,
+                        0,
+                        Some(&mut hand_mapped),
+                    )
+                    .expect("Failed to map constant buffer");
+
+                let transform_data = hand_mapped.pData as *mut TransformBuffer;
+                (*transform_data).view_proj[0] = compute_view_proj_matrix(&views[0]);
+                (*transform_data).view_proj[1] = compute_view_proj_matrix(&views[1]);
+                (*transform_data).model = model_matrix_from_pose(
+                    &left_location.pose.position,
+                    &left_location.pose.orientation,
+                    0.1, // Smaller scale for hand triangles
+                );
+
+                device_context.Unmap(&constant_buffer, 0);
+                device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
+            }
+
+            if right_action.is_active(&session, xr::Path::NULL).unwrap()
+                && right_location
+                    .location_flags
+                    .contains(xr::SpaceLocationFlags::POSITION_VALID)
+            {
+                let mut hand_mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                device_context
+                    .Map(
+                        &constant_buffer,
+                        0,
+                        D3D11_MAP_WRITE_DISCARD,
+                        0,
+                        Some(&mut hand_mapped),
+                    )
+                    .expect("Failed to map constant buffer");
+
+                let transform_data = hand_mapped.pData as *mut TransformBuffer;
+                (*transform_data).view_proj[0] = compute_view_proj_matrix(&views[0]);
+                (*transform_data).view_proj[1] = compute_view_proj_matrix(&views[1]);
+                (*transform_data).model = model_matrix_from_pose(
+                    &right_location.pose.position,
+                    &right_location.pose.orientation,
+                    0.1, // Smaller scale for hand triangles
+                );
+
+                device_context.Unmap(&constant_buffer, 0);
+                device_context.DrawInstanced(3, VIEW_COUNT, 0, 0);
+            }
 
             let mut printed = false;
             if left_action.is_active(&session, xr::Path::NULL).unwrap() {
@@ -573,30 +673,34 @@ pub fn main() {
                 },
             };
 
+            swapchain.handle.release_image().unwrap();
+
             frame_stream
                 .end(
                     xr_frame_state.predicted_display_time,
                     environment_blend_mode,
-                    &[&xr::CompositionLayerProjection::new().space(&stage).views(&[
-                        xr::CompositionLayerProjectionView::new()
-                            .pose(views[0].pose)
-                            .fov(views[0].fov)
-                            .sub_image(
-                                xr::SwapchainSubImage::new()
-                                    .swapchain(&swapchain.handle)
-                                    .image_array_index(0)
-                                    .image_rect(rect),
-                            ),
-                        xr::CompositionLayerProjectionView::new()
-                            .pose(views[1].pose)
-                            .fov(views[1].fov)
-                            .sub_image(
-                                xr::SwapchainSubImage::new()
-                                    .swapchain(&swapchain.handle)
-                                    .image_array_index(1)
-                                    .image_rect(rect),
-                            ),
-                    ])],
+                    &[
+                        &xr::CompositionLayerProjection::new().space(&stage).views(&[
+                            xr::CompositionLayerProjectionView::new()
+                                .pose(views[0].pose)
+                                .fov(views[0].fov)
+                                .sub_image(
+                                    xr::SwapchainSubImage::new()
+                                        .swapchain(&swapchain.handle)
+                                        .image_array_index(0)
+                                        .image_rect(rect),
+                                ),
+                            xr::CompositionLayerProjectionView::new()
+                                .pose(views[1].pose)
+                                .fov(views[1].fov)
+                                .sub_image(
+                                    xr::SwapchainSubImage::new()
+                                        .swapchain(&swapchain.handle)
+                                        .image_array_index(1)
+                                        .image_rect(rect),
+                                ),
+                        ]),
+                    ],
                 )
                 .unwrap();
         }
@@ -673,12 +777,25 @@ fn compute_view_proj_matrix(view: &xr::View) -> [f32; 16] {
     let wy = q.w * q.y;
     let wz = q.w * q.z;
 
-    // View matrix (inverse of model matrix from quaternion + translation)
+    // Build rotation matrix from quaternion
+    let r00 = 1.0 - 2.0 * (yy + zz);
+    let r01 = 2.0 * (xy - wz);
+    let r02 = 2.0 * (xz + wy);
+    let r10 = 2.0 * (xy + wz);
+    let r11 = 1.0 - 2.0 * (xx + zz);
+    let r12 = 2.0 * (yz - wx);
+    let r20 = 2.0 * (xz - wy);
+    let r21 = 2.0 * (yz + wx);
+    let r22 = 1.0 - 2.0 * (xx + yy);
+
+    // View matrix is inverse of camera transform: [R^T | -R^T * t]
+    // Transpose the rotation and transform the translation
+    let tx = -(r00 * p.x + r10 * p.y + r20 * p.z);
+    let ty = -(r01 * p.x + r11 * p.y + r21 * p.z);
+    let tz = -(r02 * p.x + r12 * p.y + r22 * p.z);
+
     let view_matrix = [
-        1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy), 0.0,
-        2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx), 0.0,
-        2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy), 0.0,
-        -p.x, -p.y, -p.z, 1.0,
+        r00, r01, r02, 0.0, r10, r11, r12, 0.0, r20, r21, r22, 0.0, tx, ty, tz, 1.0,
     ];
 
     // Construct projection matrix from FOV
@@ -692,10 +809,22 @@ fn compute_view_proj_matrix(view: &xr::View) -> [f32; 16] {
     let far = 100.0;
 
     let proj_matrix = [
-        2.0 / (tan_right - tan_left), 0.0, 0.0, 0.0,
-        0.0, 2.0 / (tan_up - tan_down), 0.0, 0.0,
-        (tan_right + tan_left) / (tan_right - tan_left), (tan_up + tan_down) / (tan_up - tan_down), -far / (far - near), -1.0,
-        0.0, 0.0, -(far * near) / (far - near), 0.0,
+        2.0 / (tan_right - tan_left),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.0 / (tan_up - tan_down),
+        0.0,
+        0.0,
+        (tan_right + tan_left) / (tan_right - tan_left),
+        (tan_up + tan_down) / (tan_up - tan_down),
+        -far / (far - near),
+        -1.0,
+        0.0,
+        0.0,
+        -(far * near) / (far - near),
+        0.0,
     ];
 
     // Multiply view * proj
@@ -707,12 +836,10 @@ fn compute_model_matrix(rotation_angle: f32) -> [f32; 16] {
     let cos_a = rotation_angle.cos();
     let sin_a = rotation_angle.sin();
 
-    // Rotation around Y axis, translated 1 meter forward (negative Z in OpenXR)
+    // Rotation around Y axis, translated 3 meters forward (negative Z in OpenXR)
     [
-        cos_a, 0.0, sin_a, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        -sin_a, 0.0, cos_a, 0.0,
-        0.0, 1.5, -1.0, 1.0, // Position: 1m forward, 1.5m up
+        cos_a, 0.0, sin_a, 0.0, 0.0, 1.0, 0.0, 0.0, -sin_a, 0.0, cos_a, 0.0, 0.0, 1.5, -3.0,
+        1.0, // Position: 3m forward, 1.5m up from floor
     ]
 }
 
